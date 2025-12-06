@@ -28,8 +28,159 @@ SOFTWARE.
 """
 
 import torch
+
 import deepspeed.comm as dist  # replace torch's distributed package with deepspeed.comm to resolve deepspeed check
 from deepspeed.runtime import compiler
+
+_COEFFICIENT_SETS = {
+    "simple": [
+        (3.4445, -4.7750, 2.0315),
+    ],
+    "quintic": [
+        # optimized for a quintic iteration.
+        # Source: https://leloykun.github.io/ponder/muon-opt-coeffs/#how-do-we-optimize-the-coefficients
+        # Numbers from: https://github.com/KellerJordan/modded-nanogpt/blob/master/train_gpt_medium.py#L44
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ],
+    "polar_express": [
+        # Polar Express iteration from: https://arxiv.org/abs/2505.16932
+        (7.2086, -15.5131, 9.0178),
+        (3.9623, -2.5813, 0.4542),
+        (3.9466, -2.5765, 0.4544),
+        (3.8991, -2.5671, 0.4566),
+        (3.7186, -2.5308, 0.4653),
+        (3.1390, -2.3073, 0.4733),
+        (2.1715, -1.5246, 0.3885),
+        (1.8648, -1.2224, 0.3577),
+    ],
+    "aol": [
+        # from https://github.com/thib-s/flash-newton-schulz/blob/main/newton_schulz_triton.py#L511
+        (4.0098, -7.0585, 2.4635),
+        (3.4585, -5.5479, 2.5959),
+        (2.7573, -3.2939, 1.4254),
+        (2.7215, -3.0494, 1.3169),
+    ],
+}
+
+
+def newton_schulz(
+    x: torch.Tensor,
+    steps: int,
+    coefficient_type: str = "quintic",
+    custom_coefficient_sets: list[tuple[float, float, float]] | None = None,
+    eps: float = 1e-7,
+    transpose: bool | None = None,
+) -> torch.Tensor:
+    """Use Newton-Schulz iteration to compute the zeroth power / orthogonalization of x.
+
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of x. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero and minimize variance.
+    For the purpose of minimizing steps, it turns out to be empirically effective to keep increasing the
+    slope at zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce :math:`UV^T` but rather something like :math:`US'V^T`
+    where :math:`S'` is diagonal with noisy values around 1, which turns out not to hurt model performance
+    at all relative to :math:`UV^T`, where :math:`USV^T = G` is the SVD.
+
+
+    Parameter ``coefficient_type`` can be one of the following
+      - "simple": Default coefficient set.
+      - "quintic": Quintic iteration with optimized coefficients.
+      - "polar_express": Polar Express iteration with optimized coefficients.
+      - "custom": Custom coefficient sets.
+
+    Arguments:
+        x: The tensor to be orthogonalized.
+        steps: Number of Newton-Schulz iterations.
+        coefficient_type: Type of coefficient set to use for the Newton-Schulz iteration.
+        custom_coefficient_sets: Custom coefficient sets to use for the Newton-Schulz iteration.
+        eps: Small constant to avoid division by zero.
+        transpose: Whether to transpose the tensor to perform whitening on the smaller dimension.
+            If None, will be determined based on the size of the tensor.
+        tp_group: The process group for communication if input is distributed.
+        use_syrk: Whether to use the Triton kernel for the Newton-Schulz iteration.
+
+    Returns:
+        The orthogonalization of x.
+    """
+    # Muon is not for 1d parameters
+    if x.ndim < 2:
+        raise ValueError("Input tensor x must have at least 2 dimensions since Muon is not for 1d parameters.")
+    if x.dtype != torch.float32:
+        raise ValueError(f"Input tensor x must be in float32, got {x.dtype}")
+
+    # transpose tensor to perform whitening on the smaller dimension
+    if transpose is None:
+        transpose = x.size(-2) > x.size(-1)
+    if transpose:
+        x = x.mT
+
+    # Ensure spectral norm is at most 1
+    X = torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)
+
+    if coefficient_type in _COEFFICIENT_SETS:
+        coefficient_sets = _COEFFICIENT_SETS[coefficient_type]
+    elif coefficient_type == "custom":
+        if custom_coefficient_sets is None:
+            raise ValueError("custom_coefficient_sets must be provided when coefficient_type is 'custom'.")
+        coefficient_sets = custom_coefficient_sets
+    else:
+        raise ValueError(f"Invalid coefficient type: {coefficient_type}")
+
+    if steps % len(coefficient_sets) != 0:
+        raise ValueError(f"steps ({steps}) must be multiple of len(coefficient_sets) ({len(coefficient_sets)}).")
+
+    ns_step_fn = newton_schulz_step
+    # Perform the NS iterations
+    if torch.get_float32_matmul_precision() == "medium":
+        # PyTorch doesn't really have FP32 I/O BF16 compute kernels for precision "medium"
+        # We explicitly convert to BF16 and back to FP32.
+        # NOTE: There is a small difference to calling FP32 I/O BF16 compute kernels because the final result
+        # is converted to BF16 before converting back to FP32. The rest should be the same as long as epilogue
+        # is always in FP32.
+        X = X.to(torch.bfloat16)
+        print("Using BF16 I/O kernels for Newton-Schulz iteration.")
+
+    for i in range(steps):
+        a, b, c = coefficient_sets[i % len(coefficient_sets)]
+        X = ns_step_fn(X, a, b, c)
+
+    # Convert back to FP32. This is a noop if X is already in FP32.
+    X = X.to(torch.float32)
+
+    # undo transpose if necessary
+    if transpose:
+        X = X.mT
+    return X
+
+
+def newton_schulz_step(X: torch.Tensor, a: float, b: float, c: float) -> torch.Tensor:
+    """Perform a single Newton-Schulz iteration step.
+
+    This function performs a single Newton-Schulz iteration step. It supports distributed input that's sharded
+    along the smaller (orthogonalize) dimension.
+
+    Warning:
+        If distributed, this function doesn't have the information to verify that X is sharded along the smaller
+        (orthogonalize) dimension. It is user's responsibility to ensure that X is sharded correctly.
+
+    Arguments:
+        X: The tensor to be orthogonalized.
+        a: The a coefficient.
+        b: The b coefficient.
+        c: The c coefficient.
+        tp_group: The process group to use for the all-reduce.
+
+    Returns:
+        The orthogonalization of X.
+    """
+    A = X @ X.mT
+    B = torch.addmm(A, A, A, alpha=c, beta=b)
+    X = torch.addmm(X, B, X, alpha=1.0, beta=a)
+    return X
 
 
 @compiler.compile()
@@ -43,23 +194,7 @@ def zeropower_via_newtonschulz5(G, steps: int):
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert G.ndim >= 2  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A  # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
+    return newton_schulz(G, steps, coefficient_type="quintic")
 
 
 @compiler.compile()
@@ -69,7 +204,10 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     if update.ndim == 4:  # for the case of conv filters
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    # Moonlight version: 0.2 * sqrt(max(d_out, d_in)) for consistent update RMS
+    # This aligns Muon's update RMS with AdamW (typically 0.2-0.4)
+    scale = 0.2 * max(grad.size(-2), grad.size(-1))**0.5
+    update *= scale
     return update
 
 
@@ -208,14 +346,14 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon", "name"])
             else:
                 # defaults
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon", "name"])
         super().__init__(param_groups, dict())
 
     @torch.no_grad()
