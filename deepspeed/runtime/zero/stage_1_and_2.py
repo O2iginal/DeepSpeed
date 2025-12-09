@@ -14,6 +14,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from deepspeed.runtime.zenflow import zenflow_utils
 
 import gc
+import os
 from typing import Container
 from deepspeed.runtime.zero.offload_states import offload_optimizer_states, reload_optimizer_states
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
@@ -2001,6 +2002,51 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         partition_id = dist.get_rank(group=self.real_dp_process_group[group_no])
         return [bit16_partitions[dist.get_rank(group=self.real_dp_process_group[group_no])]]
 
+    def _calculate_and_print_delta(self, group_no):
+        """Calculate and print delta update from optimizer state."""
+        if os.getenv("DS_DEBUG_DELTAS", "0") != "1" or dist.get_rank() != 0:
+            return
+        
+        fp32_param = self.single_partition_of_fp32_groups[group_no]
+        if fp32_param not in self.optimizer.state:
+            return
+        
+        state = self.optimizer.state[fp32_param]
+        if 'exp_avg' not in state or 'exp_avg_sq' not in state or 'step' not in state:
+            return
+        
+        # Get optimizer param group
+        if group_no >= len(self.optimizer.param_groups):
+            return
+        group = self.optimizer.param_groups[group_no]
+        
+        exp_avg = state['exp_avg']
+        exp_avg_sq = state['exp_avg_sq']
+        step = state['step']
+        
+        lr = group['lr']
+        eps = group['eps']
+        beta1, beta2 = group['betas']
+        bias_correction = group.get('bias_correction', True)
+        
+        if bias_correction:
+            bias_correction1 = 1 - beta1 ** step
+            bias_correction2 = 1 - beta2 ** step
+            step_size = lr / bias_correction1
+            # Calculate delta: step_size * exp_avg / (sqrt(exp_avg_sq) * sqrt(bias_correction2) + eps)
+            # Note: exp_avg_sq already includes bias_correction2 in some implementations
+            # We use the standard formula: delta = lr * m_hat / (sqrt(v_hat) + eps)
+            # where m_hat = exp_avg / (1 - beta1^step) and v_hat = exp_avg_sq / (1 - beta2^step)
+            m_hat = exp_avg / bias_correction1
+            v_hat = exp_avg_sq / bias_correction2
+            delta = lr * m_hat / (v_hat.sqrt() + eps)
+        else:
+            step_size = lr
+            delta = step_size * exp_avg / (exp_avg_sq.sqrt() + eps)
+        
+        delta_norm = delta.norm().item()
+        print(f"[RANK 0] Step {self.global_step} - Group {group_no} Delta norm: {delta_norm:.6f}")
+
     def _optimizer_step(self, group_no):
         original_param_groups = self.optimizer.param_groups
         self.optimizer.param_groups = [original_param_groups[group_no]]
@@ -2027,6 +2073,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         Not supporting closure.
         """
+        # Initialize global step counter if not exists
+        if not hasattr(self, 'global_step'):
+            self.global_step = 0
+        else:
+            self.global_step += 1
+        
         self.micro_step_id = INITIAL_MICRO_STEP_ID
 
         see_memory_usage("In step before checking overflow")
@@ -2068,9 +2120,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 single_grad_partition = self.single_partition_of_fp32_groups[i].grad
                 self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
 
+                # Print direct gradient norm
+                if os.getenv("DS_DEBUG_GRADIENTS", "0") == "1" and dist.get_rank() == 0:
+                    if single_grad_partition is not None:
+                        grad_norm = single_grad_partition.norm().item()
+                        print(f"[RANK 0] Step {self.global_step} - Group {i} Grad norm: {grad_norm:.6f}")
+
                 self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
                 self.timers(OPTIMIZER_STEP_TIMER).start()
                 self._optimizer_step(i)
+                
+                # Calculate and print delta
+                self._calculate_and_print_delta(i)
 
                 # Disabled, this is not currently working
                 #from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -2110,11 +2171,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.all_grad_tensors[i] = None
                 self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
 
+                # Print direct gradient norm
+                if os.getenv("DS_DEBUG_GRADIENTS", "0") == "1" and dist.get_rank() == 0:
+                    if single_grad_partition is not None:
+                        grad_norm = single_grad_partition.norm().item()
+                        print(f"[RANK 0] Step {self.global_step} - Group {i} Grad norm: {grad_norm:.6f}")
+
                 self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
 
                 # Step 3:- run the optimizer if no offloading
                 self.timers(OPTIMIZER_STEP_TIMER).start()
                 self._optimizer_step(i)
+                
+                # Calculate and print delta
+                self._calculate_and_print_delta(i)
                 # Step 4:- get rid of the fp32 gradients. Not needed anymore
                 self.single_partition_of_fp32_groups[i].grad = None
                 del single_grad_partition
