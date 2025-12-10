@@ -7,12 +7,31 @@ Copyright NVIDIA/apex
 This file is adapted from fused adam in NVIDIA/apex, commit 6bd01c4
 """
 
+import os
 import torch
 from .multi_tensor_apply import MultiTensorApply
 
 multi_tensor_applier = MultiTensorApply(2048 * 32)
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.op_builder import FusedAdamBuilder
+try:
+    from deepspeed import comm as dist
+except ImportError:
+    # Fallback if deepspeed.comm is not available
+    dist = None
+
+# Cache tracker getter function to avoid repeated imports
+_tracker_getter = None
+def _get_tracker():
+    """Lazy load tracker getter function once."""
+    global _tracker_getter
+    if _tracker_getter is None:
+        try:
+            from src.lit import get_lit_experiment_tracker
+            _tracker_getter = get_lit_experiment_tracker
+        except (ImportError, AttributeError):
+            _tracker_getter = lambda: None
+    return _tracker_getter() if _tracker_getter else None
 
 
 class FusedAdam(torch.optim.Optimizer):
@@ -95,6 +114,20 @@ class FusedAdam(torch.optim.Optimizer):
         # Skip buffer
         self._dummy_overflow_buf = get_accelerator().IntTensor([0])
         self.multi_tensor_adam = fused_adam_cuda.multi_tensor_adam
+        
+        # Initialize global step counter
+        self.global_step = 0
+        
+        # Cache tracker and check if we should log (only on rank 0)
+        self._tracker = None
+        self._should_log = False
+        try:
+            is_rank_0 = dist is None or dist.get_rank() == 0
+            if is_rank_0:
+                self._tracker = _get_tracker()
+                self._should_log = self._tracker is not None
+        except Exception:
+            pass
 
     def zero_grad(self):
         if self.set_grad_none:
@@ -121,7 +154,19 @@ class FusedAdam(torch.optim.Optimizer):
         if closure is not None:
             loss = closure()
 
-        for group in self.param_groups:
+        # Check if debug mode is enabled and get rank
+        debug_gradients = os.getenv("DS_DEBUG_GRADIENTS", "0") == "1"
+        is_rank_0 = dist is None or dist.get_rank() == 0
+
+        # Collect all gradients for total norm calculation (only if logging is enabled)
+        all_grads = []
+        if self._should_log:
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        all_grads.append(p.grad)
+
+        for group_idx, group in enumerate(self.param_groups):
             if len(group['params']) == 0:
                 continue
             bias_correction = 1 if group['bias_correction'] else 0
@@ -174,6 +219,17 @@ class FusedAdam(torch.optim.Optimizer):
                 else:
                     raise RuntimeError('FusedAdam only support fp16, bf16 and fp32.')
 
+            # Print gradient norms before update
+            if debug_gradients and is_rank_0:
+                grad_norms = []
+                for grad_list in [g_16, g_bf, g_32]:
+                    if len(grad_list) > 0:
+                        total_norm = sum(g.norm().item() ** 2 for g in grad_list) ** 0.5
+                        grad_norms.append(total_norm)
+                if grad_norms:
+                    total_grad_norm = sum(n ** 2 for n in grad_norms) ** 0.5
+                    print(f"[RANK 0] Step {self.global_step} - Group {group_idx} Grad norm: {total_grad_norm:.6f}")
+
             if len(g_16) > 0:
                 state['step'] += 1
                 multi_tensor_applier(self.multi_tensor_adam, self._dummy_overflow_buf, [g_16, p_16, m_16, v_16],
@@ -192,4 +248,21 @@ class FusedAdam(torch.optim.Optimizer):
                                      group['lr'], beta1, beta2, group['eps'], state['step'], self.adam_w_mode,
                                      bias_correction, group['weight_decay'])
 
+        # Calculate and log total gradient norm (lightweight, only if tracker is available)
+        if self._should_log and all_grads:
+            try:
+                # Compute total grad norm efficiently
+                total_norm_sq = 0.0
+                for grad in all_grads:
+                    total_norm_sq += grad.norm().item() ** 2
+                total_grad_norm = total_norm_sq ** 0.5
+                
+                # Log to tracker
+                self._tracker.log({'optimizer/grad_norm': total_grad_norm}, step=self.global_step)
+            except Exception:
+                # Silently fail to avoid disrupting training
+                pass
+
+        # Increment global step counter
+        self.global_step += 1
         return loss
